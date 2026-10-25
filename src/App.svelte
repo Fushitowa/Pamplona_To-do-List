@@ -1,5 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
+  import { createSupabaseClient } from './lib/supabase.js';
 
   const storageKey = 'daylist-tasks-v1';
   const noteColors = ['yellow', 'mint', 'rose', 'peach', 'sky', 'lilac'];
@@ -16,6 +17,12 @@
   const minutes = Array.from({ length: 60 }, (_, index) => String(index).padStart(2, '0'));
   let tasks = $state([]);
   let filter = $state('wall');
+  let viewMode = $state('board');
+  let activeProject = $state('All tasks');
+  let modalStatus = $state('todo');
+  let modalPriority = $state('Medium');
+  let sortOpen = $state(false);
+  let sortMode = $state('recent');
   let searchQuery = $state('');
   let theme = $state('sage');
   let themePickerOpen = $state(false);
@@ -37,6 +44,14 @@
   let reminderPermission = $state('unsupported');
   let reminderQueue = $state([]);
   let currentTime = $state(Date.now());
+  let cloudStatus = $state('local');
+  let cloudError = $state('');
+  let cloudClient = null;
+  let cloudUserId = null;
+  let cloudReady = false;
+  let syncRunning = false;
+  let syncRequested = false;
+  let syncTimer;
 
   onMount(() => {
     try {
@@ -52,6 +67,9 @@
             reminded: Boolean(task.reminded),
             notes: typeof task.notes === 'string' ? task.notes : '',
             color: noteColors.includes(task.color) ? task.color : '',
+            status: ['todo', 'progress', 'revision', 'done'].includes(task.status) ? task.status : (task.done ? 'done' : 'todo'),
+            priority: ['Low', 'Medium', 'High'].includes(task.priority) ? task.priority : 'Medium',
+            project: typeof task.project === 'string' ? task.project : 'Nova UI Revamp',
           }));
       }
     } catch {
@@ -64,17 +82,23 @@
     if ('Notification' in window) reminderPermission = Notification.permission;
     ready = true;
     checkReminders();
+    initializeCloud();
     const timer = window.setInterval(() => {
       currentTime = Date.now();
       checkReminders();
     }, 15000);
-    return () => window.clearInterval(timer);
+    return () => { window.clearInterval(timer); window.clearTimeout(syncTimer); };
   });
 
   $effect(() => {
     if (ready) {
       try { localStorage.setItem(storageKey, JSON.stringify(tasks)); } catch { /* Storage may be unavailable. */ }
     }
+  });
+
+  $effect(() => {
+    tasks;
+    if (cloudReady) queueCloudSync();
   });
 
   $effect(() => {
@@ -94,13 +118,140 @@
       || (filter === 'upcoming' && isUpcoming(task))
       || (filter === 'missed' && isMissed(task))
       || (filter === 'completed' && task.done);
-    return matchesFilter && task.title.toLowerCase().includes(searchQuery.trim().toLowerCase());
-  }));
+    const matchesProject = activeProject === 'All tasks' || task.project === activeProject;
+    return matchesFilter && matchesProject && `${task.title} ${task.notes}`.toLowerCase().includes(searchQuery.trim().toLowerCase());
+  }).sort((a, b) => sortMode === 'priority' ? ['High', 'Medium', 'Low'].indexOf(a.priority) - ['High', 'Medium', 'Low'].indexOf(b.priority) : b.createdAt - a.createdAt));
+  let projects = $derived(['Nova UI Revamp', 'Orion SaaS Platform', 'PixelFrame Website', 'Zetta Landing Page'].map((name) => ({ name, count: tasks.filter((task) => task.project === name && !task.done).length })));
+  let columns = [
+    { id: 'todo', name: 'To do', color: 'purple' },
+    { id: 'progress', name: 'In Progress', color: 'blue' },
+    { id: 'revision', name: 'Revision', color: 'orange' },
+    { id: 'done', name: 'Done', color: 'green' },
+  ];
   let upcomingCount = $derived(tasks.filter(isUpcoming).length);
   let todayCount = $derived(tasks.filter((task) => !task.done && !isUpcoming(task) && !isMissed(task)).length);
   let missedCount = $derived(tasks.filter(isMissed).length);
   let calendarMonthLabel = $derived(new Intl.DateTimeFormat('en', { month: 'long', year: 'numeric' }).format(calendarMonth));
   let calendarDays = $derived(makeCalendarDays(calendarMonth));
+
+  function taskToRow(task) {
+    return {
+      id: task.id,
+      owner_id: cloudUserId,
+      title: task.title,
+      notes: task.notes || '',
+      done: Boolean(task.done),
+      status: task.status || (task.done ? 'done' : 'todo'),
+      priority: task.priority || 'Medium',
+      project: task.project || 'Nova UI Revamp',
+      due_at: task.dueAt || null,
+      reminded: Boolean(task.reminded),
+      color: task.color || null,
+      created_at: new Date(task.createdAt || Date.now()).toISOString(),
+    };
+  }
+
+  function rowToTask(row) {
+    return {
+      id: row.id,
+      title: row.title,
+      notes: row.notes || '',
+      done: Boolean(row.done),
+      status: row.status || (row.done ? 'done' : 'todo'),
+      priority: row.priority || 'Medium',
+      project: row.project || 'Nova UI Revamp',
+      dueAt: row.due_at || '',
+      reminded: Boolean(row.reminded),
+      color: noteColors.includes(row.color) ? row.color : '',
+      createdAt: Number.isFinite(new Date(row.created_at).getTime()) ? new Date(row.created_at).getTime() : Date.now(),
+    };
+  }
+
+  async function initializeCloud() {
+    const setup = createSupabaseClient();
+    if (!setup.client) {
+      cloudStatus = setup.error ? 'error' : 'local';
+      cloudError = setup.error || '';
+      return;
+    }
+    cloudClient = setup.client;
+    cloudStatus = 'connecting';
+    try {
+      const { data: sessionData, error: sessionError } = await cloudClient.auth.getSession();
+      if (sessionError) throw sessionError;
+      let session = sessionData.session;
+      if (!session) {
+        const { data, error } = await cloudClient.auth.signInAnonymously();
+        if (error) throw error;
+        session = data.session;
+      }
+      if (!session?.user?.id) throw new Error('Supabase did not return an authenticated user.');
+      cloudUserId = session.user.id;
+
+      const { data: remoteRows, error: queryError } = await cloudClient.from('lexterbeat_tasks').select('*').order('created_at', { ascending: false });
+      if (queryError) throw queryError;
+      const migrationKey = `daylist-supabase-import-v1:${cloudUserId}`;
+      let mergedRows = remoteRows || [];
+      if (!localStorage.getItem(migrationKey)) {
+        const remoteIds = new Set(mergedRows.map((row) => row.id));
+        const localOnlyRows = tasks.filter((task) => !remoteIds.has(task.id)).map(taskToRow);
+        if (localOnlyRows.length) {
+          const { error: importError } = await cloudClient.from('lexterbeat_tasks').upsert(localOnlyRows, { onConflict: 'id' });
+          if (importError) throw importError;
+          mergedRows = [...mergedRows, ...localOnlyRows];
+        }
+        localStorage.setItem(migrationKey, 'done');
+      }
+      tasks = mergedRows.map(rowToTask);
+      cloudReady = true;
+      cloudStatus = 'synced';
+      cloudError = '';
+    } catch (error) {
+      cloudStatus = 'error';
+      cloudError = error?.message || 'Could not connect to Supabase.';
+      console.error('Supabase connection failed:', cloudError);
+    }
+  }
+
+  function queueCloudSync() {
+    syncRequested = true;
+    window.clearTimeout(syncTimer);
+    syncTimer = window.setTimeout(runCloudSync, 400);
+  }
+
+  async function runCloudSync() {
+    if (syncRunning || !cloudClient || !cloudUserId || !cloudReady) return;
+    syncRunning = true;
+    try {
+      while (syncRequested) {
+        syncRequested = false;
+        const snapshot = tasks.map((task) => ({ ...task }));
+        const rows = snapshot.map(taskToRow);
+        if (rows.length) {
+          const { error: saveError } = await cloudClient.from('lexterbeat_tasks').upsert(rows, { onConflict: 'id' });
+          if (saveError) throw saveError;
+          const keepIds = rows.map((row) => row.id).join(',');
+          const deletion = cloudClient.from('lexterbeat_tasks').delete().eq('owner_id', cloudUserId);
+          const { error: deleteError } = rows.length
+            ? await deletion.not('id', 'in', `(${keepIds})`)
+            : await deletion;
+          if (deleteError) throw deleteError;
+        } else {
+          const { error: deleteError } = await cloudClient.from('lexterbeat_tasks').delete().eq('owner_id', cloudUserId);
+          if (deleteError) throw deleteError;
+        }
+        cloudStatus = 'synced';
+        cloudError = '';
+      }
+    } catch (error) {
+      cloudStatus = 'error';
+      cloudError = error?.message || 'Cloud sync failed. Your tasks remain saved on this device.';
+      console.error('Supabase sync failed:', cloudError);
+    } finally {
+      syncRunning = false;
+      if (syncRequested) queueCloudSync();
+    }
+  }
 
   function saveNote(event) {
     event.preventDefault();
@@ -108,10 +259,10 @@
     if (!title) return;
     if (editingTaskId) {
       tasks = tasks.map((task) => task.id === editingTaskId
-        ? { ...task, title, notes: modalNotes, dueAt: modalDue, color: modalColor, reminded: task.dueAt === modalDue ? task.reminded : false }
+      ? { ...task, title, notes: modalNotes, dueAt: modalDue, color: modalColor, status: modalStatus, done: modalStatus === 'done', priority: modalPriority, reminded: task.dueAt === modalDue ? task.reminded : false }
         : task);
     } else {
-      tasks = [{ id: crypto.randomUUID(), title, done: false, createdAt: Date.now(), dueAt: modalDue, reminded: false, notes: modalNotes, color: modalColor }, ...tasks];
+      tasks = [{ id: crypto.randomUUID(), title, done: modalStatus === 'done', status: modalStatus, priority: modalPriority, project: activeProject === 'All tasks' ? 'Nova UI Revamp' : activeProject, createdAt: Date.now(), dueAt: modalDue, reminded: false, notes: modalNotes, color: modalColor }, ...tasks];
     }
     filter = 'wall';
     closeEditor();
@@ -124,6 +275,8 @@
     modalNotes = '';
     modalDue = '';
     modalColor = 'yellow';
+    modalStatus = 'todo';
+    modalPriority = 'Medium';
     datePickerOpen = false;
     calendarMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     timeHour = '09';
@@ -142,6 +295,8 @@
     modalNotes = task.notes;
     modalDue = task.dueAt;
     modalColor = task.color || 'yellow';
+    modalStatus = task.status || (task.done ? 'done' : 'todo');
+    modalPriority = task.priority || 'Medium';
     datePickerOpen = false;
     const date = task.dueAt ? new Date(task.dueAt) : new Date();
     calendarMonth = new Date(date.getFullYear(), date.getMonth(), 1);
@@ -244,7 +399,21 @@
   }
 
   function toggleTask(id) {
-    tasks = tasks.map((task) => task.id === id ? { ...task, done: !task.done } : task);
+    tasks = tasks.map((task) => task.id === id ? { ...task, done: !task.done, status: task.done ? 'todo' : 'done' } : task);
+  }
+
+  function setTaskStatus(id, status) {
+    tasks = tasks.map((task) => task.id === id ? { ...task, status, done: status === 'done' } : task);
+  }
+
+  function moveTask(id, direction) {
+    const order = columns.map((column) => column.id);
+    tasks = tasks.map((task) => {
+      if (task.id !== id) return task;
+      const index = order.indexOf(task.status || (task.done ? 'done' : 'todo'));
+      const next = Math.max(0, Math.min(order.length - 1, index + direction));
+      return { ...task, status: order[next], done: order[next] === 'done' };
+    });
   }
 
   function deleteTask(id) {
@@ -305,7 +474,7 @@
 </script>
 
 <svelte:head>
-  <title>Daylist — a little more focused</title>
+  <title>LexterBeat To do list</title>
 </svelte:head>
 
 <svelte:window onkeydown={handleWindowKeydown} />
@@ -313,125 +482,59 @@
 <div class="page-backdrop theme-{theme}">
   <div class="app-shell">
     <aside class="sidebar">
-      <a class="brand" href="#home" aria-label="Daylist home">
-        <span class="brand-mark"><span></span><span></span><span></span></span>
-        <span>daylist<span class="brand-period">.</span></span>
-      </a>
-
-      <div class="menu-heading"><span>MENU</span><span class="menu-mark">☰</span></div>
-      <label class="search-box"><span>⌕</span><input aria-label="Search tasks" bind:value={searchQuery} placeholder="Search" /></label>
-
-      <div class="side-label">TASKS</div>
+      <a class="brand" href="#home" aria-label="LexterBeat To do list home"><span class="brand-mark"><span></span><span></span><span></span></span><span class="brand-name">LexterBeat</span><span class="brand-chevron">⌄</span></a>
+      <div class="side-label">MAIN MENU</div>
+      <label class="search-box"><span>⌕</span><input aria-label="Search tasks" bind:value={searchQuery} placeholder="Search tasks" /></label>
       <nav class="nav-group" aria-label="Task views">
-        <button class="nav-item" class:selected={filter === 'upcoming'} aria-current={filter === 'upcoming' ? 'page' : undefined} onclick={() => filter = 'upcoming'}>
-          <span class="nav-icon">»</span><span>Upcoming</span><span class="nav-count">{upcomingCount}</span>
-        </button>
-        <button class="nav-item" class:selected={filter === 'today'} aria-current={filter === 'today' ? 'page' : undefined} onclick={() => filter = 'today'}>
-          <span class="nav-icon">▦</span><span>Today</span><span class="nav-count">{todayCount}</span>
-        </button>
-        <button class="nav-item" class:selected={filter === 'missed'} aria-current={filter === 'missed' ? 'page' : undefined} onclick={() => filter = 'missed'}>
-          <span class="nav-icon">!</span><span>Missed</span><span class="nav-count">{missedCount}</span>
-        </button>
-        <button class="nav-item" class:selected={filter === 'completed'} aria-current={filter === 'completed' ? 'page' : undefined} onclick={() => filter = 'completed'}>
-          <span class="nav-icon">✓</span><span>Completed</span><span class="nav-count">{completed}</span>
-        </button>
+        <button class="nav-item" class:selected={filter === 'wall'} onclick={() => { filter = 'wall'; activeProject = 'All tasks'; }}><span class="nav-icon">▦</span><span>Dashboard</span></button>
+        <button class="nav-item" class:selected={filter === 'wall' && activeProject === 'All tasks'} onclick={() => { filter = 'wall'; activeProject = 'All tasks'; }}><span class="nav-icon">▤</span><span>Tasks</span><span class="nav-count">{remaining}</span></button>
+        <button class="nav-item" class:selected={filter === 'upcoming'} onclick={() => filter = 'upcoming'}><span class="nav-icon">▧</span><span>Calendar</span></button>
+        <button class="nav-item" class:selected={filter === 'completed'} onclick={() => filter = 'completed'}><span class="nav-icon">♙</span><span>Members</span></button>
+        <button class="nav-item" class:selected={filter === 'missed'} onclick={() => filter = 'missed'}><span class="nav-icon">▥</span><span>Reports</span></button>
       </nav>
-
-      <div class="side-label lists-label">VIEWS</div>
-      <button class="nav-item" class:selected={filter === 'wall'} aria-current={filter === 'wall' ? 'page' : undefined} onclick={() => filter = 'wall'}>
-        <span class="nav-icon">▤</span><span>To-do List</span>
-      </button>
-
-      <div class="side-label appearance-label">APPEARANCE</div>
-      <button class="nav-item theme-nav-item" aria-expanded={themePickerOpen} aria-controls="workspace-theme-picker" onclick={() => themePickerOpen = !themePickerOpen}>
-        <span class="nav-icon">◉</span><span>Theme</span><span class="theme-preview" style={`--swatch: ${selectedTheme.preview}`}></span><span class="theme-chevron">{themePickerOpen ? '⌃' : '⌄'}</span>
-      </button>
-      {#if themePickerOpen}
-        <div class="theme-picker" id="workspace-theme-picker" role="group" aria-label="Choose workspace theme color">
-          <span class="theme-picker-label">Workspace color</span>
-          <div class="theme-swatches">
-            {#each workspaceThemes as option}
-              <button type="button" class="theme-swatch" class:active={theme === option.id} style={`--swatch: ${option.preview}`} aria-label={`Use ${option.name} theme`} aria-pressed={theme === option.id} title={option.name} onclick={() => theme = option.id}></button>
-            {/each}
-          </div>
-          <span class="theme-current">{selectedTheme.name}</span>
-        </div>
-      {/if}
-
-      <div class="sidebar-bottom">
-        <div class="focus-card">
-          <span class="focus-spark">✳</span>
-          <p>Make a little progress.<br />Then make a little more.</p>
-          <span class="focus-caption">A LITTLE REMINDER</span>
-        </div>
+      <div class="sidebar-section-title"><span>PROJECTS</span><button aria-label="Add project" title="Add project" onclick={openCreateNote}>+</button></div>
+      <nav class="project-nav" aria-label="Projects">
+        {#each projects as project}<button class="project-link" class:active={activeProject === project.name} onclick={() => { activeProject = project.name; filter = 'wall'; }}><span class="project-folder">▱</span><span>{project.name}</span></button>{/each}
+      </nav>
+      <div class="sidebar-lower"><div class="side-label">SETTINGS</div>
+        <button class="nav-item theme-nav-item" aria-expanded={themePickerOpen} onclick={() => themePickerOpen = !themePickerOpen}><span class="nav-icon">⚙</span><span>Appearance</span><span class="theme-preview" style={`--swatch: ${selectedTheme.preview}`}></span></button>
+        {#if themePickerOpen}<div class="theme-picker" role="group" aria-label="Choose workspace theme color"><span class="theme-picker-label">Workspace color</span><div class="theme-swatches">{#each workspaceThemes as option}<button type="button" class="theme-swatch" class:active={theme === option.id} style={`--swatch: ${option.preview}`} aria-label={`Use ${option.name} theme`} onclick={() => theme = option.id}></button>{/each}</div><span class="theme-current">{selectedTheme.name}</span></div>{/if}
       </div>
     </aside>
 
     <main id="home" class="main-area">
-      <header class="topbar">
-        <div class="breadcrumb">MY SPACE <span>/</span> <strong>{filter === 'wall' ? 'TO-DO LIST' : filter === 'today' ? 'TODAY' : filter === 'upcoming' ? 'UPCOMING' : filter === 'missed' ? 'MISSED' : 'COMPLETED'}</strong></div>
-        <div class="top-actions">
-          {#if reminderPermission === 'granted'}
-            <span class="reminder-status enabled" title="Browser reminders are enabled">◉ <span>Reminders on</span></span>
-          {:else if reminderPermission === 'denied'}
-            <span class="reminder-status" title="Allow notifications for this site in your browser settings">◉ <span>Notifications blocked</span></span>
-          {:else if reminderPermission === 'unsupported'}
-            <span class="reminder-status" title="This browser does not support notifications">◉ <span>Reminders unavailable</span></span>
-          {:else}
-            <button class="reminder-button" onclick={enableReminders}>Enable reminders</button>
-          {/if}
-          <span class="date-chip"><span class="calendar-icon">▦</span>{todayLabel}</span>
-        </div>
-      </header>
-
+      <header class="topbar"><div class="breadcrumb">Manage and track your tasks seamlessly with clear priorities and progress.</div><div class="top-actions">
+        <span class="cloud-status cloud-{cloudStatus}" title={cloudError || (cloudStatus === 'synced' ? 'Your tasks are synced to Supabase' : cloudStatus === 'local' ? 'Tasks are saved in this browser until Supabase is configured' : 'Connecting to Supabase')}><i></i>{cloudStatus === 'synced' ? 'Cloud synced' : cloudStatus === 'connecting' ? 'Connecting…' : cloudStatus === 'error' ? 'Cloud issue' : 'Device storage'}</span>
+        {#if reminderPermission === 'default'}<button class="reminder-button" onclick={enableReminders}>♧ Enable reminders</button>{:else if reminderPermission === 'granted'}<span class="reminder-status enabled">♧ <span>Reminders on</span></span>{:else if reminderPermission === 'denied'}<span class="reminder-status">♧ <span>Reminders blocked</span></span>{:else}<span class="reminder-status">♧</span>{/if}
+        <span class="manager-chip"><span class="manager-avatar">{new Intl.DateTimeFormat('en',{weekday:'short'}).format(new Date()).slice(0,1)}</span><span>My workspace</span><span>⌄</span></span>
+      </div></header>
       <section class="content">
-        <div class="page-heading">
-          <div><div class="eyebrow"><span class="sun-icon">✳</span> YOUR TASKS, ALL IN ONE PLACE</div><h1>{filter === 'upcoming' ? 'Upcoming' : filter === 'today' ? 'Today' : filter === 'missed' ? 'Missed' : filter === 'completed' ? 'Completed' : 'To-do List'} <span class="heading-count">{visibleTasks.length}</span></h1></div>
-          <div class="heading-date">{todayLabel}</div>
-        </div>
-
-        <div class="list-heading"><div><h2>{filter === 'wall' ? 'Your tasks' : filter === 'upcoming' ? 'Coming up' : filter === 'today' ? 'For today' : filter === 'missed' ? 'Missed tasks' : 'Completed tasks'}</h2><span class="task-total">{remaining} {remaining === 1 ? 'task' : 'tasks'} to go</span></div>
-          <div class="filters" aria-label="Filter tasks">
-            <button class:active={filter === 'wall'} aria-pressed={filter === 'wall'} onclick={() => filter = 'wall'}>Open <span>{remaining}</span></button>
-            <button class:active={filter === 'today'} aria-pressed={filter === 'today'} onclick={() => filter = 'today'}>To do <span>{remaining}</span></button>
-            <button class:active={filter === 'completed'} aria-pressed={filter === 'completed'} onclick={() => filter = 'completed'}>Done <span>{completed}</span></button>
+        <div class="board-toolbar"><div class="view-tabs" aria-label="Task view">
+          <button class:active={viewMode === 'board'} onclick={() => viewMode = 'board'}>▣ <span>Board</span></button><button class:active={viewMode === 'list'} onclick={() => viewMode = 'list'}>☷ <span>List</span></button><button class:active={viewMode === 'table'} onclick={() => viewMode = 'table'}>▦ <span>Table</span></button><button class:active={viewMode === 'timeline'} onclick={() => viewMode = 'timeline'}>◷ <span>Timeline</span></button>
+        </div><div class="board-actions"><button onclick={() => sortOpen = !sortOpen}>☷ <span>Filter</span></button><button onclick={() => sortMode = sortMode === 'recent' ? 'priority' : 'recent'}>↕ <span>Sort</span></button><button onclick={() => viewMode = 'board'}>◇ <span>Group by</span></button><button class="primary-add" aria-label="Add task" onclick={openCreateNote}>+</button></div></div>
+        {#if filter !== 'wall'}<div class="filter-summary"><span>{filter === 'today' ? 'Today' : filter === 'upcoming' ? 'Upcoming tasks' : filter === 'missed' ? 'Missed tasks' : 'Completed tasks'}</span><button onclick={() => filter = 'wall'}>Clear filter ×</button></div>{/if}
+        {#if sortOpen}<div class="filter-popover"><span>Filter tasks</span><button onclick={() => {filter='wall';sortOpen=false}}>All tasks</button><button onclick={() => {filter='today';sortOpen=false}}>Today</button><button onclick={() => {filter='upcoming';sortOpen=false}}>Upcoming</button><button onclick={() => {filter='completed';sortOpen=false}}>Completed</button><button onclick={() => {filter='missed';sortOpen=false}}>Missed</button></div>{/if}
+        {#if viewMode === 'board'}
+          <div class="kanban-board">
+            {#each columns as column}<section class="board-column" aria-label={`${column.name} tasks`}><header class="column-heading"><div><span class="column-dot {column.color}"></span><h2>{column.name}</h2><span class="column-count">{visibleTasks.filter((task) => (task.status || (task.done ? 'done' : 'todo')) === column.id).length}</span></div><div class="column-controls"><button aria-label={`Add ${column.name} task`} onclick={openCreateNote}>+</button><button aria-label={`${column.name} options`}>···</button></div></header>
+              <div class="column-cards">{#each visibleTasks.filter((task) => (task.status || (task.done ? 'done' : 'todo')) === column.id) as task (task.id)}<article class="task-card"><div class="task-card-meta"><span class="priority-badge priority-{task.priority.toLowerCase()}">{task.priority}</span><button class="card-menu" aria-label={`Edit ${task.title}`} onclick={(event) => openEditNote(task,event)}>···</button></div><button class="task-card-title" onclick={(event) => openEditNote(task,event)}>{task.title}</button>{#if task.notes}<p class="task-card-description">{task.notes}</p>{/if}<div class="task-card-footer"><div class="assignees"><span class="assignee assignee-one">{task.title.slice(0,1).toUpperCase()}</span><span class="assignee assignee-two">{task.project.slice(0,1)}</span></div><div class="card-stats">{#if task.dueAt}<span title={formatDue(task.dueAt)}>◷ {new Intl.DateTimeFormat('en',{month:'short',day:'numeric'}).format(new Date(task.dueAt))}</span>{/if}<button aria-label="Mark complete" onclick={() => toggleTask(task.id)}>☐</button><button class="delete-card" aria-label={`Delete ${task.title}`} onclick={() => deleteTask(task.id)}>×</button></div></div><div class="card-move"><span>{task.project}</span><select aria-label={`Move ${task.title}`} value={task.status || (task.done ? 'done' : 'todo')} onchange={(event) => setTaskStatus(task.id,event.currentTarget.value)}>{#each columns as option}<option value={option.id}>{option.name}</option>{/each}</select></div></article>{/each}
+                {#if visibleTasks.filter((task) => (task.status || (task.done ? 'done' : 'todo')) === column.id).length === 0}<button class="column-empty" onclick={openCreateNote}>+ Add a task</button>{/if}</div></section>{/each}
           </div>
-        </div>
-
-        <div class="sticky-grid">
-          {#if visibleTasks.length}
-            {#each visibleTasks as task, index (task.id)}
-              <article class="sticky-note" class:note-yellow={noteColor(task, index) === 'yellow'} class:note-mint={noteColor(task, index) === 'mint'} class:note-rose={noteColor(task, index) === 'rose'} class:note-peach={noteColor(task, index) === 'peach'} class:note-sky={noteColor(task, index) === 'sky'} class:note-lilac={noteColor(task, index) === 'lilac'} class:done-note={task.done}>
-                <div class="note-topline">
-                  <button class="check-button" class:checked={task.done} aria-label={task.done ? `Mark ${task.title} as to do` : `Complete ${task.title}`} onclick={() => toggleTask(task.id)}>{#if task.done}<span>✓</span>{/if}</button>
-                  <button class="note-edit" aria-label={`Edit ${task.title}`} title="Edit task" onclick={(event) => openEditNote(task, event)}>✎</button>
-                  <button class="delete-button" aria-label={`Delete ${task.title}`} onclick={() => deleteTask(task.id)}>×</button>
-                </div>
-                <button class="note-title" class:crossed-out={task.done} onclick={(event) => openEditNote(task, event)}>{task.title}</button>
-                <p class="note-body">{task.notes || 'Add a few details to this task...'}</p>
-                <div class="note-due">◷ <span>{task.dueAt ? formatDue(task.dueAt) : 'Add due date & time'}</span></div>
-              </article>
-            {/each}
-          {:else if searchQuery.trim()}
-            <div class="empty-state"><div class="empty-icon">⌕</div><strong>No matching tasks.</strong><span>Try another search.</span></div>
-          {:else}
-            <div class="empty-state"><div class="empty-icon">{filter === 'wall' ? '✓' : filter === 'missed' ? '!' : '✳'}</div><strong>{filter === 'wall' ? 'You’re all caught up.' : filter === 'upcoming' ? 'Nothing coming up yet.' : filter === 'missed' ? 'No missed tasks.' : filter === 'completed' ? 'No completed tasks yet.' : 'Nothing planned for today.'}</strong><span>{filter === 'wall' ? 'Completed tasks are in Completed.' : filter === 'upcoming' ? 'Add a future due date to a task.' : filter === 'missed' ? 'Tasks past their due date will show here.' : filter === 'completed' ? 'Finished tasks will collect here.' : 'Add a task or choose another view.'}</span></div>
-          {/if}
-          <button class="add-note-tile" type="button" onclick={openCreateNote} aria-label="Add a new task">
-            <div class="new-note-icon">+</div>
-            <span class="add-note-label">Add a new task...</span>
-          </button>
-        </div>
-        <footer class="content-footer"><span>MADE FOR A CALMER KIND OF PRODUCTIVITY</span><span>ONE THING AT A TIME <b>✳</b></span></footer>
+        {:else if viewMode === 'list'}
+          <div class="list-view">{#each visibleTasks as task (task.id)}<div class="list-row"><button class="row-check" class:checked={task.done} aria-label="Toggle complete" onclick={() => toggleTask(task.id)}>{task.done ? '✓' : ''}</button><button class="row-task-title" onclick={(event) => openEditNote(task,event)}>{task.title}<small>{task.notes || task.project}</small></button><span class="priority-badge priority-{task.priority.toLowerCase()}">{task.priority}</span><select aria-label={`Status for ${task.title}`} value={task.status || (task.done ? 'done' : 'todo')} onchange={(event) => setTaskStatus(task.id,event.currentTarget.value)}>{#each columns as column}<option value={column.id}>{column.name}</option>{/each}</select><button class="row-edit" onclick={(event) => openEditNote(task,event)}>Edit</button></div>{/each}<button class="list-add" onclick={openCreateNote}>+ Add a task</button></div>
+        {:else if viewMode === 'table'}
+          <div class="table-view"><table><thead><tr><th>Task</th><th>Project</th><th>Priority</th><th>Status</th><th>Due date</th></tr></thead><tbody>{#each visibleTasks as task (task.id)}<tr><td><button class="row-task-title" onclick={(event) => openEditNote(task,event)}>{task.title}</button></td><td>{task.project}</td><td><span class="priority-badge priority-{task.priority.toLowerCase()}">{task.priority}</span></td><td><select aria-label={`Status for ${task.title}`} value={task.status || (task.done ? 'done' : 'todo')} onchange={(event) => setTaskStatus(task.id,event.currentTarget.value)}>{#each columns as column}<option value={column.id}>{column.name}</option>{/each}</select></td><td>{task.dueAt ? formatDue(task.dueAt) : '—'}</td></tr>{/each}</tbody></table><button class="list-add" onclick={openCreateNote}>+ Add a task</button></div>
+        {:else}
+          <div class="timeline-view"><div class="timeline-heading"><h2>Task timeline</h2><span>{visibleTasks.length} tasks</span></div>{#each visibleTasks as task (task.id)}<button class="timeline-row" onclick={(event) => openEditNote(task,event)}><span class="timeline-date">{task.dueAt ? new Intl.DateTimeFormat('en',{month:'short',day:'numeric'}).format(new Date(task.dueAt)) : 'No date'}</span><span class="timeline-track"><i class="column-dot {task.status === 'done' ? 'green' : task.status === 'progress' ? 'blue' : 'purple'}"></i><b>{task.title}</b><small>{task.project}</small></span><span class="priority-badge priority-{task.priority.toLowerCase()}">{task.priority}</span></button>{/each}<button class="list-add" onclick={openCreateNote}>+ Add a task</button></div>
+        {/if}
       </section>
     </main>
-
   </div>
   {#if modalOpen}
     <div class="modal-backdrop">
       <dialog bind:this={paperDialog} class="paper-sheet paper-{modalColor}" aria-labelledby="paper-title" oncancel={(event) => { event.preventDefault(); closeEditor(); }}>
-        <div class="paper-header"><span class="paper-kicker">DAYLIST <span>·</span> YOUR TASKS</span><button type="button" class="paper-close" aria-label="Close editor" onclick={closeEditor}>×</button></div>
-        <h2 id="paper-title">{editingTaskId ? 'Edit your task' : 'A new task'}</h2>
+        <div class="paper-header"><span class="paper-kicker">LEXTERBEAT <span>·</span> TO DO LIST</span><button type="button" class="paper-close" aria-label="Close editor" onclick={closeEditor}>×</button></div>
+        <h2 id="paper-title">{editingTaskId ? 'Edit task' : 'Create a task'}</h2>
         <form class="paper-form" onsubmit={saveNote}>
           <label class="paper-label" for="paper-task-title">WHAT DO YOU NEED TO DO?</label>
           <input id="paper-task-title" class="paper-title-input" bind:this={titleInput} bind:value={modalTitle} maxlength="160" placeholder="Write a task title..." required />
@@ -474,6 +577,8 @@
             {/if}
           </div>
 
+          <div class="editor-row"><label><span class="paper-label">STATUS</span><select bind:value={modalStatus}>{#each columns as column}<option value={column.id}>{column.name}</option>{/each}</select></label><label><span class="paper-label">PRIORITY</span><select bind:value={modalPriority}><option>Low</option><option>Medium</option><option>High</option></select></label></div>
+
           <fieldset class="color-fieldset">
             <legend class="paper-label">PAPER COLOR</legend>
             <div class="color-options">
@@ -493,7 +598,7 @@
     <div class="due-reminder-overlay">
       <dialog open class="due-reminder-card" aria-modal="true" aria-labelledby="due-reminder-title" aria-describedby="due-reminder-details">
         <div class="reminder-card-top">
-          <span class="reminder-brand"><span class="reminder-brand-mark">d.</span> DAYLIST REMINDER</span>
+          <span class="reminder-brand"><span class="reminder-brand-mark">L</span> LEXTERBEAT REMINDER</span>
           <button class="reminder-close" type="button" aria-label="Dismiss reminder" onclick={dismissReminder}>×</button>
         </div>
         <div class="reminder-clock-mark" aria-hidden="true"><span>◷</span></div>
